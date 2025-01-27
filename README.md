@@ -107,14 +107,15 @@ curl -k -u elastic:<pass> -X GET https://localhost:9200/_cat/health
 ![image](https://github.com/user-attachments/assets/9b7954a8-ed60-4dbf-962a-1500fa4d8c29)
 
 Как видим, три ноды доступны в кластере. Состояние кластера _green_. Далее можно создавать индексы, указывая количество шардов и реплик (в нашем случае оптимальным вариантом будет 3 шарда и 2 реплики).
- 
+
+----------------- 
 ### Деплой elasticsearch+kibana на одной ноде, настройка сбора логов из frontend, backend, database (с помощью Terraform и Ansible)
 
 Схема проекта:
 
 ![otus highload scheme v3](https://github.com/user-attachments/assets/207cecd1-2b5b-419c-8e87-d33ae2b89c94)
 
-С помощью Terraform поднимается виртуальная машина под Elasticsearch и Kibana, а также создается ansible-playbook из шаблона. Далее с помощью Ansible на эту виртуальную машину устанавливается и настраивается необходимый софт, в том числе Filebeat на серверах групп frontend, backend, database. 
+С помощью Terraform поднимается виртуальная машина под Elasticsearch и Kibana, а также создается ansible-playbook из шаблона. Далее с помощью Ansible на эту виртуальную машину устанавливается и настраивается необходимый софт, в том числе __Filebeat__ на серверах групп frontend, backend, database. 
 
 С серверов группы frontend снимаются логи /var/log/nginx/\*.log. С серверов группы backend снимаются логи /var/log/apache/\*.log. С серверов группы frontend снимаются логи /var/log/syslog. 
 
