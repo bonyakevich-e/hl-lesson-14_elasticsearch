@@ -125,4 +125,12 @@ $ ansible-playbook -i hosts playbook.yml
 ```
 В итоге панель Kibana будет доступо по внешнему ip сервера `elasticsearch`, на порту `5601`. Там же в разделе __Analytics -> Discover__ будут отображаться логи с указанных серверов:
 
+![nginx](https://github.com/user-attachments/assets/3d8e52fc-4314-4799-93d3-378b46e547f7)
+
+![2](https://github.com/user-attachments/assets/6ad0519b-d5b6-4086-bec6-51ad3ee2fa6f)
+
+![3](https://github.com/user-attachments/assets/155dc308-c101-4561-aaeb-b260a7516ee5)
+
+
+
 
