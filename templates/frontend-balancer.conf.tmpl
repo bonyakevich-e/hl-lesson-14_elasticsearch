@@ -1,0 +1,17 @@
+upstream backend {
+    ip_hash;
+    #zone upstream-backend 10m;
+    %{ for node in backend ~}
+        server ${node.network_interface.0.ip_address} fail_timeout=60s;
+    %{ endfor ~}
+}
+
+server {
+        listen 80;
+        server_name otus.highload.com;
+        location / {
+                proxy_pass http://backend;
+                proxy_set_header Host $host;
+                proxy_connect_timeout 10s;
+        }
+}

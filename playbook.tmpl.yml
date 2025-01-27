@@ -1,0 +1,697 @@
+---
+- hosts: all
+  remote_user: ${remote_user}
+  become: yes
+  gather_facts: no
+  tasks:
+  
+# ждем пока виртуальные машины придут в себя. иначе могу быть баги с утановкой пакетов  
+  - name: Pause for 2 minutes
+    ansible.builtin.pause:
+      minutes: 2
+
+  - name: Wait for system to become reachable
+    ansible.builtin.wait_for_connection:
+
+  - name: Gather facts manually
+    ansible.builtin.setup:
+  
+  - name: Set timezone
+    timezone:
+      name: Europe/Moscow
+  
+  - name: Add entries to hosts
+    copy:
+      dest: /etc/hosts
+      content: "#\n
+127.0.0.1	localhost\n
+%{ for node in backend ~}
+${node.network_interface.0.ip_address}	${node.hostname}\n
+%{ endfor ~}
+%{ for node in frontend ~}
+${node.network_interface.0.ip_address}	${node.hostname}\n
+%{ endfor ~}
+${storage.network_interface.0.ip_address}	${storage.hostname}\n
+${database.network_interface.0.ip_address}	${database.hostname}\n
+${elasticsearch.network_interface.0.ip_address}	${elasticsearch.hostname}\n
+"
+
+# ================================= setup iscsi target ===============================
+- hosts: storage
+  remote_user: ${remote_user}
+  become: yes
+  tasks:
+ 
+  - name: Install targetcli-fb
+    apt:
+      name: targetcli-fb
+      state: present
+  
+  - name: Configure target using bash script
+    script: iscsi_target.bash
+
+# =============================== setup gfs2 on backend servers ======================
+
+- hosts: backend
+  remote_user: ${remote_user}
+  become: yes
+  vars:
+  - iqn_base: ${iqn_base}
+  tasks:
+  
+  - name: Install packages
+    apt:
+      name: "{{ item }}"
+      state: latest
+    with_items:
+    - pacemaker
+    - pcs
+    - gfs2-utils
+    - open-iscsi
+    - lvm2
+    - dlm-controld
+    - lvm2-lockd
+    - resource-agents-extra
+    - resource-agents-common
+    - resource-agents-base
+    - watchdog 
+    - pcp-zeroconf
+    - fence-agents-scsi
+    - apache2
+
+# меняем iqn iscsi клиентов
+  - name: Change InitiatorName in initiatorname.iscsi
+    ansible.builtin.lineinfile:
+      path: /etc/iscsi/initiatorname.iscsi
+      regexp: '^InitiatorName='
+      line: InitiatorName=${iqn_base}:${backend_name}.{{ inventory_hostname }}
+
+# настраиваем автоподключение iscsi диска при запуске системы
+  - name: Configure iscsi client to autoconnect after reboot
+    tags: set iscsi autoconnect
+    ansible.builtin.lineinfile:
+      path: /etc/iscsi/iscsid.conf
+      regexp: '^node.startup'
+      line: node.startup = automatic
+
+  - name: restart iscsid
+    service: 
+      name: iscsid
+      state: restarted
+
+# подключаем iscsi диск на ноды
+  - name: Discover iscsi target
+    community.general.open_iscsi:
+      show_nodes: true
+      discover: true
+      portal: ${storage.hostname}
+
+  - name: Connect to the target  
+    community.general.open_iscsi:
+      login: true
+      target: '${iqn_base}:storage.target00'
+
+# автозапуск и автоподключение iscsi диска при загрузке системы
+  - name: Start iscsi
+    service:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    with_items:
+      - iscsi
+
+# по дефолту Pacemaker запускает свою службу под пользователем hacluster
+  - name: Set password for hacluster to '123'
+    user:
+      name: hacluster
+      password: $5$A55.Uz8o.y8MuGaf$w3axEzoOgSeGyJo3OE56a4Ki1ctGEWP1GMyU7tOVJu6
+
+# стартуем pcsd
+  - name: Start cluster services
+    service:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    with_items:
+      - pcsd
+
+# аутентифицируем ноды, которые будут составлять наш кластер
+  - name: authorize among nodes
+    run_once: true
+    command:
+      cmd: /sbin/pcs host auth -u hacluster -p 123 %{for node in backend}${node.hostname} %{endfor}
+      creates: /var/lib/pcsd/tokens
+
+# настраиваем кластер
+  - name: configure cluster
+    tags: set cluster
+    run_once: true
+    command:
+      cmd: pcs cluster setup ${backend_name} --start --enable%{for node in backend} ${node.hostname}%{endfor} --force
+      
+
+# копируем fencing скрипт для мониторинга iscsi в watchdog.d
+  - name: copy fence_scsi_check script to watchdog.d directory
+    tags: copy fence_scsi_check
+    ansible.builtin.copy:
+      src: /usr/share/cluster/fence_scsi_check
+      dest: /etc/watchdog.d/
+      remote_src: yes
+
+# запускаем watchdog
+  - name: start watchdog
+    tags: start watchdog
+    ansible.builtin.service:
+      name: watchdog
+      state: started
+      enabled: yes
+
+# получаем wwn-идентификатор iscsi диска
+  - name: confirm iscsi disk ID
+    tags: wwn-id
+    run_once: true
+    ansible.builtin.shell: ls -l /dev/disk/by-id | grep sda | grep wwn | cut -d ' ' -f 10
+    register: wwn_id
+
+  - name: show wwn id
+    tags: wwn-id
+    run_once: true
+    ansible.builtin.debug: 
+      msg: WWN-ID  {{wwn_id.stdout}}
+    
+
+# настраиваем fencing
+  - name: set fencing
+    tags: set fencing
+    run_once: true
+    ansible.builtin.command: 
+      cmd: pcs stonith create scsi-shooter fence_scsi pcmk_host_list="%{for node in backend} ${node.hostname}%{endfor}" devices=/dev/disk/by-id/{{wwn_id.stdout}} meta provides=unfencing
+    
+# включаем поддержку lvmlockd
+  - name: uncomment use_lvmlockd in lvm.conf
+    tags: set use_lvmlockd
+    ansible.builtin.lineinfile:
+      dest: /etc/lvm/lvm.conf
+      regexp: '#\s*use_lvmlockd = 0'
+      line: 'use_lvmlockd = 1'
+
+# устанавливаем [no-quorum-policy=freeze] на GFS2
+  - name: Freeze a no-quorum policy
+    tags: set no-quorum-policy
+    run_once: true
+    command: /sbin/pcs property set no-quorum-policy=freeze
+
+# Создаем ресурс controld
+  - name: create controld resource
+    tags: set controld
+    run_once: true
+    command: /sbin/pcs resource create dlm ocf:pacemaker:controld op monitor interval=30s on-fail=fence group locking --future
+    register: result
+    failed_when:
+      - result.rc != 0 and "already exists" not in result.stderr
+
+  - name: create clone of [locking] to activate it on all nodes in cluster
+    tags: set locking
+    run_once: true
+    command: pcs resource clone locking interleave=true
+
+# Создаем ресурс lvmlockd
+  - name: create lvmlockd resource
+    tags: set lvmlockd
+    run_once: true
+    command: /sbin/pcs resource create lvmlockdd ocf:heartbeat:lvmlockd op monitor interval=30s on-fail=fence group locking --future
+    register: result
+    failed_when:
+      - result.rc != 0 and "already exists" not in result.stderr
+
+  - name: wait 30 seconds
+    ansible.builtin.wait_for:
+      timeout: 30
+
+# создаем кластерный VG на iscsi диске
+  - name: create a PV and VG
+    tags: set vg
+    run_once: true
+    community.general.lvg:
+      pvs: /dev/sda
+      vg: ${vg_name}
+      vg_options: --shared
+
+# на всех нодах запускаем lock manager для iscsi диска
+  - name: start lock manager for shared volume
+    tags: set lockmanager
+    command: vgchange --lock-start ${vg_name} 
+
+# создаем LV 
+  - name: create logical volume
+    tags: set lv
+    run_once: true
+    community.general.lvol:
+      vg: ${vg_name}
+      lv: ${lv_name}
+      size: 100%VG
+
+# создаем кластерную файловую систему gfs2 на только что созданном LV
+  - name: create a FS
+    tags: set fs
+    run_once: true
+    command: mkfs.gfs2 -j ${backend_size} -p lock_dlm -t ${backend_name}:${fs_name} -O /dev/${vg_name}/${lv_name}
+    register: result
+    failed_when:
+    - result.rc != 0
+    - '"Device or resource busy" not in result.stderr'
+
+# создаем LVM-activate ресурс
+  - name: create LVM-activate resource
+    tags: set LVM-activate
+    run_once: true
+    command: pcs resource create shared_lv ocf:heartbeat:LVM-activate lvname=${lv_name} vgname=${vg_name} activation_mode=shared vg_access_mode=lvmlockd group shared_vg --future
+
+  - name: create clone of [LVM-activate]
+    tags: set LVM-activate
+    run_once: true
+    command: pcs resource clone shared_vg interleave=true
+
+# устанавливаем порядок запуска ресурсов
+  - name: set that [shared_vg] and [locking] start on a same node
+    tags: set constraint
+    run_once: true
+    command: pcs constraint colocation add shared_vg-clone with locking-clone
+    register: result
+    failed_when:
+      - result.rc != 0 and "already exists" not in result.stderr
+
+# создаем Filesystem ресурс
+  - name: create Filesystem resource
+    tags: create filesystem resource
+    run_once: true
+    command: pcs resource create shared_fs ocf:heartbeat:Filesystem device="/dev/${vg_name}/${lv_name}" directory="/var/www" fstype="gfs2" options=noatime op monitor interval=10s on-fail=fence group shared_vg --future
+
+  - name: Pause for 20 seconds
+    ansible.builtin.pause:
+      seconds: 20
+
+# =============================== setup web on backend servers ======================
+
+- hosts: backend
+  tags: prepare backend for web hosting
+  remote_user: ubuntu
+  become: yes
+  tasks:
+
+  - name: install prerequisites
+    ansible.builtin.apt:
+      name:
+        - libapache2-mod-php
+        - php-gd
+        - php-mysql
+        - php-curl
+        - php-mbstring
+        - php-intl
+        - php-gmp
+        - php-bcmath
+        - php-xml
+        - php-imagick
+        - php-zip
+        - mariadb-client
+      state: present
+      update_cache: true
+    notify: restart apache2
+
+  - name: Enable recommended apache modules
+    tags: enable_apache2_modules_web1
+    community.general.apache2_module:
+      state: present
+      name: "{{ item }}" 
+    with_items:
+      - rewrite
+      - headers
+      - env
+      - dir
+      - mime
+    notify: restart apache2
+  
+  - name: enable apache2 service
+    ansible.builtin.service:
+      name: apache2
+      enabled: true
+
+  - name: modify apache2.conf
+    ansible.builtin.template:
+      src: templates/apache2.conf
+      dest: /etc/apache2/apache2.conf
+    notify:
+      - restart apache2
+
+  - name: add vhost for nextcloud
+    ansible.builtin.template:
+      src: nextcloud.conf.j2
+      dest: /etc/apache2/sites-available/nextcloud.conf
+    notify:
+      - enable nextcloud vhost
+      - restart apache2
+
+  handlers:
+  - name: enable nextcloud vhost
+    ansible.builtin.shell: /usr/sbin/a2ensite nextcloud.conf
+
+  - name: restart apache2
+    ansible.builtin.service:
+      name: apache2
+      state: restarted
+
+# =============================== setup Nextcloud  ======================
+
+- hosts: ${backend[0].hostname}
+  tags: setup nextcloud
+  remote_user: ubuntu
+  become: yes
+  tasks:
+
+  - name: Extact nextcloud-30.0.4.tar.bz2 into storage directory
+    ansible.builtin.unarchive:
+      src: https://cloud.baltbereg.com/index.php/s/K7gXPYBEpc9Ygkw/download/nextcloud-30.0.4.tar.bz2
+      dest: /var/www
+      remote_src: yes
+
+  - name: change nextcloud files' owner
+    ansible.builtin.file:
+      path: /var/www/nextcloud
+      state: directory
+      recurse: yes
+      owner: www-data
+      group: www-data
+
+# ============================ setup database MariaDB ===================
+
+- hosts: ${database.hostname}
+  tags: setup database
+  remote_user: ubuntu
+  become: yes
+  tasks:
+
+  - name: Generate an OpenSSH keypair with the default values (4096 bits, rsa)
+    community.crypto.openssh_keypair:
+      path: /root/.ssh/id_rsa
+
+  - name: Install pip
+    ansible.builtin.apt:
+      name: python3-pip
+      state: present
+      update_cache: true
+
+  - name: Install PyMySQL
+    pip:
+      name: pymysql
+      state: present
+      break_system_packages: true
+
+  - name: install mariadb
+    ansible.builtin.apt:
+      name:
+        - mariadb-server
+        - mariadb-backup
+        - mariadb-client
+      state: present
+      update_cache: true
+
+  - name: enable mariadb
+    ansible.builtin.service:
+      name: mariadb
+      enabled: true
+
+  - name: copy mariadb settings file
+    ansible.builtin.template:
+      src: 50-server.cnf.j2
+      dest: /etc/mysql/mariadb.conf.d/50-server.cnf
+      mode: '0600'
+    notify: restart mariadb
+
+  - name: flush handlers
+    meta: flush_handlers
+
+  - name: Check if mysql root password was not set
+    shell: >
+      mysql -u root
+      -h localhost
+      -e "quit"
+    changed_when: false
+    ignore_errors: true
+    register: check_passwd_root
+
+  - name: Set MariaDB root password
+    community.mysql.mysql_user:
+      name: root
+      password: ${mysql_root_password}
+      login_user: root
+      login_unix_socket: "/run/mysqld/mysqld.sock"
+      state: present
+    when: check_passwd_root.rc == 0
+
+  - name: Removes all anonymous user accounts
+    community.mysql.mysql_user:
+      name: ''
+      host_all: true
+      state: absent
+      login_user: root
+      login_password: ${mysql_root_password}
+    notify: flush privileges
+
+  - name: Remove test database
+    mysql_db:
+      login_user: "root"
+      login_password: ${mysql_root_password}
+      db: "test"
+      state: absent
+    notify: flush privileges
+
+  - name: create nextcloud database
+    community.mysql.mysql_db:
+      name: nextcloud
+      encoding: utf8mb4
+      collation: utf8mb4_general_ci
+      state: present
+      login_user: root
+      login_password: ${mysql_root_password}
+
+  - name: create nextcloud user
+    tags: create_nextcloud_user
+    community.mysql.mysql_user:
+      name: ${nc_db_username}
+      password: ${nc_db_password}
+      priv: 'nextcloud.*:ALL'
+      host: '%'
+      login_user: root
+      login_password: ${mysql_root_password}
+      state: present
+    notify: flush privileges
+
+  handlers:
+  - name: flush privileges
+    command: mysql -u root -p${mysql_root_password} -e "FLUSH PRIVILEGES"
+
+  - name: restart mariadb
+    ansible.builtin.service:
+      name: mariadb
+      state: restarted
+
+# =========================== make Nextcloud initial setup ========================
+
+- hosts: ${backend[0].hostname}
+  tags: nextcloud init
+  remote_user: ubuntu
+  become: yes
+  tasks:  
+
+  - name: make initial configuration of Nextcloud
+    command: sudo -u www-data php occ  maintenance:install --database-host='${database.hostname}' --database='mysql' --database-name='nextcloud' --database-user='${nc_db_username}' --database-pass='${nc_db_password}' --admin-user='${nc_web_admin_name}' --admin-pass='${nc_web_admin_password}'
+    args: 
+      chdir: /var/www/nextcloud
+
+  - name: add trusted domains to nextcloud config.php
+    tags: add trusted domains
+    ansible.builtin.lineinfile:
+      path: /var/www/nextcloud/config/config.php
+      insertafter: 0 => 'localhost',
+      line: "    1 => 'otus.highload.com',"
+
+# ========================== setup fronend ===================================
+
+- hosts: frontend
+  tags: setup frontend
+  remote_user: ubuntu
+  become: yes
+  tasks: 
+
+  - name: UnInstall angie
+    tags: uninstall angie
+    ansible.builtin.apt: 
+      name: angie
+      state: absent
+      update_cache: true
+
+  - name: UnInstall angie-console-light
+    tags: uninstall angie console
+    ansible.builtin.apt: 
+      name: angie-console-light
+      state: absent
+      update_cache: true
+
+  - name: Install nginx
+    tags: install nginx
+    ansible.builtin.apt: 
+      name: nginx
+      state: present
+      update_cache: true
+
+
+  - name: Copy nginx config
+    tags: copy nginx config
+    ansible.builtin.copy:
+      src: 'templates/frontend-balancer.conf'
+      dest: '/etc/nginx/sites-enabled/frontend-balancer.conf'
+    notify: restart nginx
+
+  handlers: 
+  - name: restart nginx
+    ansible.builtin.service:
+      name: nginx
+      state: restarted 
+
+
+# ================== setup elasticsearch ==========================
+
+- hosts: elasticsearch
+  tags: set up elasticsearch
+  remote_user: ${remote_user}
+  become: yes
+  tasks:
+
+  - name: add yandex cloud elasticsearch mirror
+    tags: add yandex cloud elasticsearch mirror
+    shell: 'echo "deb [trusted=yes] https://mirror.yandex.ru/mirrors/elastic/8/ stable main" | sudo tee /etc/apt/sources.list.d/elastic-8.x.list'
+
+  - name: install elasticsearch, kibana
+    tags: install elasticsearch kibana
+    ansible.builtin.apt:
+      name: 
+        - elasticsearch
+        - kibana
+      state: present
+      update_cache: true
+
+  - name: Change elasticsearch cluster.name
+    tags: change cluster.name
+    ansible.builtin.lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: '#cluster.name'
+      line: 'cluster.name: elasticsearch'
+
+  - name: Change elasticsearch network.host
+    tags: change network.host
+    ansible.builtin.lineinfile:
+      path: /etc/elasticsearch/elasticsearch.yml
+      regexp: '#network.host'
+      line: 'network.host: 0.0.0.0'  
+
+  - name: start and enable elasticsearch, kibana
+    tags: start and enable elasticsearch kibana
+    ansible.builtin.service:
+      name: "{{ item }}"
+      state: started
+      enabled: true
+    with_items:
+      - elasticsearch
+      - kibana
+
+  - name: change password for user "elastic"
+    tags: change elastic pass
+    shell: 'printf "OtusHL\nOtusHL" | /usr/share/elasticsearch/bin/elasticsearch-reset-password -b -i -u elastic' 
+
+  - name: change password for user "kibana_system"
+    tags: change kibana_system pass
+    shell: 'printf "OtusHL\nOtusHL" | /usr/share/elasticsearch/bin/elasticsearch-reset-password -b -i -u kibana_system'
+
+  - name: copy certs to /etc/kibana
+    tags: copy certs to kibana
+    ansible.builtin.copy:
+      src: /etc/elasticsearch/certs
+      dest: /etc/kibana
+      owner: root
+      group: kibana
+      remote_src: yes
+
+  - name: copy kibana config
+    tags: copy kibana config
+    ansible.builtin.copy:
+      src: templates/elasticsearch/kibana.yml
+      dest: /etc/kibana
+      owner: root
+      group: kibana
+    notify: restart kibana
+  
+  handlers:
+  - name: restart kibana
+    tags: restart kibana
+    ansible.builtin.service:
+      name: kibana
+      state: restarted
+
+- hosts: frontend, backend, database
+  tags: set up filebeat on servers
+  remote_user: ${remote_user}
+  become: yes
+  tasks:
+
+  - name: Add yandex cloud elasticsearch mirror
+    tags: filebeat on servers step 1
+    shell: 'echo "deb [trusted=yes] https://mirror.yandex.ru/mirrors/elastic/8/ stable main" | sudo tee /etc/apt/sources.list.d/elastic-8.x.list'
+
+  - name: Install filebeat
+    tags: filebeat on servers step 2
+    ansible.builtin.apt:
+      name: filebeat
+      state: present
+      update_cache: true
+
+  - name: Copy filebeat configuration
+    tags: filebeat on servers step 3
+    ansible.builtin.template:
+      src: templates/elasticsearch/filebeat.yml.j2
+      dest: /etc/filebeat/filebeat.yml
+
+  - name: Create filebeat certs directory
+    tags: filebeat on servers step 4
+    ansible.builtin.file:
+      path: /etc/filebeat/certs
+      state: directory
+
+  - name: fetch http_ca certificate from elasticsearch
+    tags: filebeat on servers step 5
+    delegate_to: elasticsearch
+    shell: cat /etc/elasticsearch/certs/http_ca.crt
+    register: http_ca
+
+  - name: Copy http_ca.crt from elasticsearch to filebeat
+    tags: filebeat on servers step 6
+    ansible.builtin.copy:
+      content: "{{ http_ca.stdout }}"
+      dest: /etc/filebeat/certs/http_ca.crt
+    
+  - name: Setup filebeat
+    tags: filebeat on servers step 7
+    run_once: true
+    command: filebeat setup -e
+    register: result
+    failed_when:
+      - result.rc != 0 and "already exists" not in result.stderr
+  
+  - name: start and enable filebeat
+    tags: filebeat on servers step 8
+    ansible.builtin.service:
+      name: filebeat
+      state: started
+      enabled: true
+
+
+

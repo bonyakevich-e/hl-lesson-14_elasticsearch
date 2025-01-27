@@ -1,0 +1,15 @@
+<VirtualHost *:80>
+  DocumentRoot /var/www/nextcloud/
+  ServerName  otus.highload.com
+#  CustomLog "||/usr/bin/logger -t apache2.nextcloud.access -i -p local6.notice" combined  
+
+  <Directory /var/www/nextcloud/>
+    Require all granted
+    AllowOverride All
+    Options FollowSymLinks MultiViews
+
+    <IfModule mod_dav.c>
+      Dav off
+    </IfModule>
+  </Directory>
+</VirtualHost>

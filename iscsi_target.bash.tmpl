@@ -1,0 +1,21 @@
+#!/bin/bash
+
+targetcli << EOF
+
+cd /backstores/block
+create disk01 /dev/vdb
+
+cd /iscsi
+create ${iqn_base}:storage.target00
+
+cd /iscsi/${iqn_base}:storage.target00/tpg1/luns
+create /backstores/block/disk01 lun=1
+
+cd ..
+set attribute authentication=0
+
+cd acls/
+%{ for node in backend ~}
+create ${iqn_base}:${backend_name}.${node.hostname}
+%{ endfor ~}
+EOF

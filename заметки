@@ -1,0 +1,107 @@
+в /etc/hosts:
+...
+...
+10.16.0.19 elasticsearch1
+
+
+echo "deb [trusted=yes] https://mirror.yandex.ru/mirrors/elastic/8/ stable main" | sudo tee /etc/apt/sources.list.d/elastic-8.x.list
+apt-get update && apt-get install elasticsearch
+systemctl enable elasticsearch.service
+
+--------------------------- Security autoconfiguration information ------------------------------
+
+Authentication and authorization are enabled.
+TLS for the transport and HTTP layers is enabled and configured.
+
+The generated password for the elastic built-in superuser is : CTFzU425D=4EHDbhBR4p
+
+If this node should join an existing cluster, you can reconfigure this with
+'/usr/share/elasticsearch/bin/elasticsearch-reconfigure-node --enrollment-token <token-here>'
+after creating an enrollment token on your existing cluster.
+
+You can complete the following actions at any time:
+
+Reset the password of the elastic built-in superuser with 
+'/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic'.
+
+Generate an enrollment token for Kibana instances with 
+ '/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana'.
+
+Generate an enrollment token for Elasticsearch nodes with 
+'/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s node'.
+
+-------------------------------------------------------------------------------------------------
+### NOT starting on installation, please execute the following statements to configure elasticsearch service to start automatically using systemd
+ sudo systemctl daemon-reload
+ sudo systemctl enable elasticsearch.service
+### You can start elasticsearch service by executing
+ sudo systemctl start elasticsearch.service
+
+
+vim /etc/elasticsearch/elasticsearch.yml
+cluster.name: es-cluster
+network.host: 0.0.0.0
+transport.host: 0.0.0.0
+cluster.initial_master_nodes: ["elasticsearch1"]
+
+systemctl start elasticsearch.service
+
+/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i
+OtusHL
+
+
+Мониторинг:
+curl -k -u elastic:OtusHL -X GET https://localhost:9200/_cat/nodes?v - количество нод в кластере
+curl -k -u elastic:OtusHL -X GET https://localhost:9200/_cat/health - статус кластера
+curl -k -u elastic:OtusHL -X GET https://localhost:9200/_cat/shards?v - показать шарды
+curl -k -u elastic:OtusHL -X GET https://localhost:9200/_cat/indices?v - показать индексы
+
+генерируем токен для добавления нод:
+/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s node
+
+На нодах которые будем добавлять в кластер:
+cluster.name: es-cluster
+network.host: 0.0.0.0
+transport.host: 0.0.0.0
+
+/usr/share/elasticsearch/bin/elasticsearch-reconfigure-node --enrollment-token eyJ2ZXIiOiI4LjE0LjAiLCJhZHIiOlsiMTAuMTYuMC4xOTo5MjAwIl0sImZnciI6IjFjNjYyOTg4YWNkZTgzNDI3YWI2YzRmNjU0NWNlYTAyNjA0NzY2YjVkZWZiMjMzZjVjMDc4ZGRiNTlkNTU3YzQiLCJrZXkiOiJnanVvaDVRQmRNdzd5cXpxVU1BdTptRE5NckhWdlFoMnpWU1V4ZWNoNTN3In0=
+
+This node will be reconfigured to join an existing cluster, using the enrollment token that you provided.
+This operation will overwrite the existing configuration. Specifically: 
+  - Security auto configuration will be removed from elasticsearch.yml
+  - The [certs] config directory will be removed
+  - Security auto configuration related secure settings will be removed from the elasticsearch.keystore
+Do you want to continue with the reconfiguration process [y/N]
+
+systemctl start elasticsearch.service
+
+На всех нодах в конфиг добавляем: 
+discovery.seed_hosts: ["elasticsearch1", "elasticsearch2", "elasticsearch3"]
+cluster.initial_master_nodes: ["elasticsearch1", "elasticsearch2", "elasticsearch3"]
+# cluster.initial_master_nodes: ["elasticsearch1"] ('это есть только на первой мастер ноде')
+по умолчанию в файле еще discovery.seed_hosts: c ip адресом мастер ноды. Удаляем строчку или заменяем её на ту что выше
+
+Ставим Kibana:
+
+echo "deb [trusted=yes] https://mirror.yandex.ru/mirrors/elastic/8/ stable main" | sudo tee /etc/apt/sources.list.d/elastic-8.x.list
+apt-get update && apt-get install kibana
+
+vim /etc/kibana/kibana.yml
+server.host: 0.0.0.0
+systemctl restart kibana
+
+генерируем токен для kibana (выполняем на хосте elasticsearch):
+/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+
+переходим на веб-интерфейс kibana: 
+kibana-ip:5601
+и вставляем сгенерированный токен
+
+генерируем verification-code (выполняем на хосте kibana) и вставляем его в браузер:
+/usr/share/kibana/bin/kibana-verification-code
+
+меняем в конфиге kibana:
+elasticsearch.hosts:
+  - https://elasticsearch1:9200
+  - https://elasticsearch2:9200
+  - https://elasticsearch3:9200
